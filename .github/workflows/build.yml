@@ -1,0 +1,33 @@
+name: Build Kernel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install deps
+      run: |
+        sudo apt update
+        sudo apt install -y bc bison flex libssl-dev make gcc git
+
+    - name: Toolchain
+      run: |
+        git clone https://github.com/arter97/arm64-gcc toolchain
+
+    - name: Build
+      run: |
+        export ARCH=arm64
+        export CROSS_COMPILE=$PWD/toolchain/bin/aarch64-linux-gnu-
+        make exynos3830_defconfig || make defconfig
+        make -j$(nproc)
+
+    - name: Upload
+      uses: actions/upload-artifact@v3
+      with:
+        name: kernel
+        path: arch/arm64/boot/Image
