@@ -1,0 +1,325 @@
+name: Build A21s Kernel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ────────────────────────────────────────────────────────
+      # 1. Install dependencies
+      # ────────────────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            git curl wget file \
+            bc bison flex zip unzip \
+            libssl-dev make \
+            libc6-dev libncurses5-dev libelf-dev \
+            gcc g++ \
+            clang lld llvm \
+            python3 python2 binutils patch
+
+      # ────────────────────────────────────────────────────────
+      # 2. Fix ccache (stub để không lỗi)
+      # ────────────────────────────────────────────────────────
+      - name: Fix ccache
+        run: |
+          sudo mkdir -p /usr/local/bin
+          printf '#!/bin/bash\nexec "$@"\n' | sudo tee /usr/local/bin/ccache
+          sudo chmod +x /usr/local/bin/ccache
+          echo "/usr/local/bin" >> $GITHUB_PATH
+
+      # ────────────────────────────────────────────────────────
+      # 3. Clone kernel (Atlas - đã có KernelSU rsuntk submodule)
+      # ────────────────────────────────────────────────────────
+      - name: Clone kernel
+        run: |
+          rm -rf kernel
+          git clone --depth=1 \
+            https://github.com/samsungexynos850/atlas \
+            kernel
+
+      # ────────────────────────────────────────────────────────
+      # 4. Setup KernelSU-Next (thay thế KernelSU cũ trong Atlas)
+      # ────────────────────────────────────────────────────────
+      - name: Setup KernelSU-Next
+        run: |
+          cd kernel
+
+          # Xoá KernelSU cũ của Atlas (rsuntk fork)
+          rm -rf KernelSU drivers/kernelsu drivers/ksu
+
+          # Cài KernelSU-Next (stable branch, hỗ trợ 4.14-6.6)
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            | bash -s stable
+
+          # -L để follow symlink do setup.sh tạo ra
+          KSU_DIR=$(find -L drivers -type d \( -name "kernelsu" -o -name "ksu" \) | head -n 1)
+          [ -z "$KSU_DIR" ] && KSU_DIR="KernelSU/kernel"
+          echo "Using KSU_DIR=$KSU_DIR"
+
+          # ==================================================
+          # FIX MODULE_IMPORT_NS (không tồn tại trên 4.14)
+          # ==================================================
+          sed -i '/MODULE_IMPORT_NS/d' "$KSU_DIR/core/init.c" || true
+
+          # ==================================================
+          # FIX SAMSUNG 4.14 OLD API (file_wrapper)
+          # ==================================================
+          FILE_WRAPPER=$(find drivers -name file_wrapper.c | head -n 1)
+          if [ -f "$FILE_WRAPPER" ]; then
+            sed -i '/iopoll/d;/remap_file_range/d;/REMAP_FILE_DEDUP/d' "$FILE_WRAPPER" || true
+          fi
+
+          # ==================================================
+          # FIX UNDEFINED SYMBOLS
+          # Comment thay vì xóa để tránh syntax error (else mồ côi)
+          # (đang ở cd kernel nên KHÔNG có prefix "kernel/")
+          # ==================================================
+          sed -i 's/\(.*ksu_handle_sys_reboot.*\)/\/\/ \1/g' kernel/reboot.c       || true
+          sed -i 's/\(.*ksu_vfs_read_hook.*\)/\/\/ \1/g'     fs/read_write.c       || true
+          sed -i 's/\(.*ksu_execveat_hook.*\)/\/\/ \1/g'     fs/exec.c             || true
+          sed -i 's/\(.*ksu_input_hook.*\)/\/\/ \1/g'        drivers/input/input.c || true
+
+      # ────────────────────────────────────────────────────────
+      # 5. Patch SUSFS cho kernel 4.14 (non-GKI)
+      # ────────────────────────────────────────────────────────
+      - name: Patch SUSFS
+        run: |
+          cd kernel
+
+          # Clone SUSFS repo branch kernel-4.14
+          git clone --depth=1 \
+            -b kernel-4.14 \
+            https://gitlab.com/simonpunk/susfs4ksu.git \
+            ../susfs4ksu
+
+          # Bước 1: copy file nguồn SUSFS vào kernel tree
+          cp -v ../susfs4ksu/kernel_patches/fs/susfs.c               fs/
+          cp -v ../susfs4ksu/kernel_patches/fs/sus_su.c               fs/ 2>/dev/null || true
+          cp -v ../susfs4ksu/kernel_patches/include/linux/susfs.h     include/linux/
+          cp -v ../susfs4ksu/kernel_patches/include/linux/sus_su.h    include/linux/ 2>/dev/null || true
+
+          # Bước 2: apply patch tích hợp SUSFS vào kernel
+          cp -v ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch .
+          patch -p1 --forward --fuzz=3 < 50_add_susfs_in_kernel-4.14.patch || true
+          rm -f 50_add_susfs_in_kernel-4.14.patch
+
+          # Bước 3: apply patch tích hợp SUSFS vào KernelSU
+          KSU_DIR=$(find -L drivers -type d \( -name "kernelsu" -o -name "ksu" \) | head -n 1)
+          [ -z "$KSU_DIR" ] && KSU_DIR="KernelSU/kernel"
+          if [ -f "../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
+            cp -v ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch .
+            # apply vào thư mục KernelSU
+            pushd "$(dirname $KSU_DIR)" > /dev/null
+            patch -p1 --forward --fuzz=3 < "$(dirs -l +1)/10_enable_susfs_for_ksu.patch" || true
+            popd > /dev/null
+            rm -f 10_enable_susfs_for_ksu.patch
+          fi
+
+          echo "[+] SUSFS patch done"
+
+      # ────────────────────────────────────────────────────────
+      # 6. Overclock Mali-G52 lên 1196 MHz (Exynos 850)
+      # ────────────────────────────────────────────────────────
+      - name: GPU Overclock Mali-G52 1196MHz
+        run: |
+          cd kernel
+
+          # File chứa bảng tần số GPU của Exynos 850
+          GPU_TABLE=$(grep -rl "gpu_dvfs_table\|gpu_max_clock\|GPU_MAX_CLOCK" \
+            drivers/gpu/ arch/ --include="*.c" --include="*.h" 2>/dev/null | head -n 5)
+
+          echo "Found GPU freq files:"
+          echo "$GPU_TABLE"
+
+          # ── Thêm mục 1196 MHz vào bảng DVFS nếu chưa có ──
+          for f in $GPU_TABLE; do
+            # Thêm entry 1196MHz trước entry max cũ (thường là 949 hoặc 1196)
+            if grep -q "949000\|949\b" "$f" 2>/dev/null; then
+              # Bảng có giá trị kHz: thêm 1196000 kHz
+              sed -i '/949000/{
+                h
+                s/949000/1196000/
+                H
+                x
+              }' "$f" || true
+              echo "[+] Added 1196000 kHz entry in $f"
+            fi
+          done
+
+          # ── Patch trực tiếp file platform Exynos850 GPU ──
+          GPU_PLATFORM=$(find drivers/gpu -name "*.c" | \
+            xargs grep -l "gpu_max_clock\|exynos.*gpu.*freq\|mali.*exynos" 2>/dev/null | head -n 1)
+
+          if [ -n "$GPU_PLATFORM" ]; then
+            echo "GPU platform file: $GPU_PLATFORM"
+            # Thay max clock thành 1196
+            sed -i 's/\.gpu_max_clock\s*=\s*[0-9]*/\.gpu_max_clock = 1196/' "$GPU_PLATFORM" || true
+            echo "[+] Set gpu_max_clock = 1196 in $GPU_PLATFORM"
+          fi
+
+          # ── Patch DTS/DTSI nếu có opp-table GPU ──
+          GPU_DTS=$(grep -rl "mali\|gpu" arch/arm64/boot/dts/ \
+            --include="*.dts" --include="*.dtsi" 2>/dev/null | head -n 3)
+
+          for dts in $GPU_DTS; do
+            if grep -q "opp-hz\|gpu-opp" "$dts" 2>/dev/null; then
+              # Thêm OPP 1196 MHz = 1196000000 Hz
+              if ! grep -q "1196000000" "$dts"; then
+                sed -i '/opp-hz.*[0-9]\{9\}/{
+                  /1196000000/!{
+                    i\\t\t\topp-1196000000 {\n\t\t\t\topp-hz = /bits/ 64 <1196000000>;\n\t\t\t\topp-microvolt = <850000>;\n\t\t\t};
+                  }
+                }' "$dts" || true
+                echo "[+] Added 1196MHz OPP in $dts"
+              fi
+            fi
+          done
+
+          echo "[+] GPU OC patch done"
+
+      # ────────────────────────────────────────────────────────
+      # 7. Fix scripts build
+      # ────────────────────────────────────────────────────────
+      - name: Fix scripts
+        run: |
+          cd kernel
+          chmod +x scripts/config || true
+          printf '#!/bin/sh\nexit 0\n' > scripts/min-tool-version.sh
+          chmod +x scripts/min-tool-version.sh
+
+      # ────────────────────────────────────────────────────────
+      # 8. Build kernel
+      # ────────────────────────────────────────────────────────
+      - name: Build kernel
+        run: |
+          cd kernel
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export KBUILD_BUILD_USER="Gemini"
+          export KBUILD_BUILD_HOST="Github-Actions"
+
+          make exynos850-a21snsxx_defconfig
+
+          # KernelSU-Next
+          ./scripts/config --enable  KSU              || true
+          ./scripts/config --enable  KSU_SUSFS         || true
+          ./scripts/config --enable  KSU_SUSFS_SUS_PATH || true
+          ./scripts/config --enable  KSU_SUSFS_SUS_MOUNT || true
+          ./scripts/config --enable  KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT || true
+          ./scripts/config --enable  KSU_SUSFS_SUS_KSTAT || true
+          ./scripts/config --enable  KSU_SUSFS_TRY_UMOUNT || true
+          ./scripts/config --enable  KSU_SUSFS_SPOOF_UNAME || true
+          ./scripts/config --enable  KSU_SUSFS_ENABLE_LOG || true
+
+          # Hooks & overlayfs
+          ./scripts/config --enable  KPROBES           || true
+          ./scripts/config --enable  OVERLAY_FS        || true
+          ./scripts/config --enable  KPROBE_EVENTS     || true
+
+          # Giảm bootloop Samsung
+          ./scripts/config --disable LTO               || true
+          ./scripts/config --disable CFI_CLANG         || true
+
+          yes "" | make olddefconfig
+
+          make -j$(nproc) \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CC=clang \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            HOSTCC=gcc \
+            HOSTCXX=g++ \
+            2>&1 | tee ../build.log
+
+      # ────────────────────────────────────────────────────────
+      # 9. Debug: List kernel boot files
+      # ────────────────────────────────────────────────────────
+      - name: Debug kernel image
+        run: |
+          echo "=== Listing kernel boot files ==="
+          ls -lh kernel/arch/arm64/boot/ || echo "kernel/arch/arm64/boot/ not found"
+          echo ""
+          echo "=== Listing kernel root ==="
+          ls -lh kernel/ | head -20
+          echo ""
+          echo "=== Check kernel build output ==="
+          tail -50 build.log || echo "build.log not found"
+
+      # ────────────────────────────────────────────────────────
+      # 10. Pack AnyKernel3
+      # ────────────────────────────────────────────────────────
+      - name: Pack AnyKernel3
+        run: |
+          rm -rf AnyKernel3
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3
+
+          # Tìm kernel image theo thứ tự ưu tiên
+          KERNEL_IMAGE=""
+          for f in \
+            kernel/arch/arm64/boot/Image.gz-dtb \
+            kernel/arch/arm64/boot/Image.gz \
+            kernel/arch/arm64/boot/Image \
+            kernel/arch/arm64/boot/zImage \
+            kernel/Image \
+            kernel/Image.gz \
+            kernel/Image.gz-dtb; do
+            if [ -f "$f" ]; then
+              KERNEL_IMAGE="$f"
+              echo "[+] Found kernel image: $KERNEL_IMAGE"
+              break
+            fi
+          done
+
+          if [ -z "$KERNEL_IMAGE" ]; then
+            echo "ERROR: Kernel image not found in any expected path!"
+            echo "Available files in kernel/arch/arm64/boot/:"
+            find kernel/arch/arm64/boot/ -type f 2>/dev/null || echo "  (not found)"
+            echo ""
+            echo "Build likely failed. Check build.log:"
+            tail -100 build.log || echo "  (build.log not found)"
+            exit 1
+          fi
+
+          echo "Using kernel image: $KERNEL_IMAGE"
+          cp -v "$KERNEL_IMAGE" AnyKernel3/
+
+          cd AnyKernel3
+          # Rename image to standard name nếu cần
+          if [ "$(basename $KERNEL_IMAGE)" != "Image" ] && [ "$(basename $KERNEL_IMAGE)" != "Image.gz-dtb" ]; then
+            mv "$(basename $KERNEL_IMAGE)" Image || true
+          fi
+
+          sed -i 's/device.name1=.*/device.name1=SM-A217F/' anykernel.sh || true
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/'     anykernel.sh || true
+          zip -r9 ../A21s-Kernel-KSU-SUSFS-OC.zip ./*
+
+      # ────────────────────────────────────────────────────────
+      # 11. Upload artifacts
+      # ────────────────────────────────────────────────────────
+      - name: Upload kernel zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: A21s-Kernel-KSU-SUSFS-OC
+          path: A21s-Kernel-KSU-SUSFS-OC.zip
+
+      # Upload build log luôn luôn dù fail để debug
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
