@@ -25,7 +25,7 @@
 #define SLSI_NOA_CONFIG_REQUEST_ID          (1)
 #define SLSI_MLME_ARP_DROP_FREE_SLOTS_COUNT 16
 
-static bool missing_cfm_ind_panic = true;
+static bool missing_cfm_ind_panic = false;
 module_param(missing_cfm_ind_panic, bool, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(missing_cfm_ind_panic, "Panic on missing confirm or indication from the chip");
 
@@ -65,27 +65,8 @@ static struct sk_buff *slsi_mlme_wait_for_cfm(struct slsi_dev *sdev, struct slsi
 	if (!sig_wait->cfm) {
 		SLSI_ERR(sdev, "No cfm(0x%.4X) for req(0x%04X) senderid=0x%x\n", sig_wait->cfm_id, sig_wait->req_id, sig_wait->process_id);
 		if (tm == 0) {
-			char reason[80];
-
 			WARN(1, "Timeout - confirm 0x%04x not received from chip\n", sig_wait->cfm_id);
-			if (missing_cfm_ind_panic) {
-				snprintf(reason, sizeof(reason), "Timed out while waiting for the cfm(0x%.4x) for req(0x%04x)",
-					 sig_wait->cfm_id, sig_wait->req_id);
-
-				spin_unlock_bh(&sig_wait->send_signal_lock);
-				/* Stop sending signals down*/
-				sdev->mlme_blocked = true;
-				queue_work(sdev->device_wq, &sdev->trigger_wlan_fail_work);
-				r = wait_for_completion_timeout(&sdev->service_fail_started_indication,
-							msecs_to_jiffies(SLSI_WLAN_FAIL_WORK_TIMEOUT));
-				if (r == 0) {
-					SLSI_INFO(sdev, "service_fail_started_indication timeout\n");
-					sprintf(log_to_sys_error_buffer, "service_fail_started_indication timeout in cfm\n");
-					slsi_add_log_to_system_error_buffer(sdev, log_to_sys_error_buffer);
-				}
-
-				spin_lock_bh(&sig_wait->send_signal_lock);
-			}
+			
 		} else {
 			WARN(1, "Confirm 0x%04x lost\n", sig_wait->cfm_id);
 		}
@@ -107,9 +88,7 @@ static struct sk_buff *slsi_mlme_wait_for_cfm(struct slsi_dev *sdev, struct slsi
 
 static int panic_on_lost_ind(u16 ind_id)
 {
-	if (ind_id == MLME_SCAN_DONE_IND)
-		return 0;
-	return 1;
+	return 0;
 }
 
 static struct sk_buff *slsi_mlme_wait_for_ind(struct slsi_dev *sdev, struct net_device *dev, struct slsi_sig_send *sig_wait, u16 ind_id)

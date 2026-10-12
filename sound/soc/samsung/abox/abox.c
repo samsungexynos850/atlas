@@ -499,7 +499,10 @@ static void abox_process_ipc(struct work_struct *work)
 			ret = __abox_process_ipc(dev, data, hw_irq, msg, size);
 			if (ret < 0) {
 				abox_failsafe_report(dev);
-				BUG_ON(error++ > THRESHOLD);
+				if (error++ > THRESHOLD) {
+					dev_err_ratelimited(dev, "%s: IPC timeout threshold reached, suppressing panic\n", __func__);
+					error = 0;
+				}
 				dev_dbg(dev, "%d\n", error);
 			} else {
 				error = 0;

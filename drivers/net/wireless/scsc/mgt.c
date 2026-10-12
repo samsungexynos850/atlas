@@ -7571,7 +7571,7 @@ void slsi_trigger_service_failure(struct work_struct *work)
 	char reason[80];
 
 	snprintf(reason, sizeof(reason), "Service fail - no MLME cfm/ind received");
-	slsi_sm_service_failed(sdev, reason, true);
+	slsi_sm_service_failed(sdev, reason, false);
 }
 
 void slsi_failure_reset(struct work_struct *work)

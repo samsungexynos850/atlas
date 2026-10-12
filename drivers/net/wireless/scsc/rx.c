@@ -920,50 +920,6 @@ void slsi_handle_wips_beacon(struct slsi_dev *sdev, struct net_device *dev, stru
 
 void slsi_rx_rcl_channel_list_ind(struct slsi_dev *sdev, struct net_device *dev, struct sk_buff *skb)
 {
-	struct netdev_vif     *ndev_vif = netdev_priv(dev);
-	u32                   channel_count = 0;
-	u16                   channel_list[MAX_CHANNEL_COUNT] = {0};
-	int                   i = 7; /* 1byte (id) + 1byte(length) + 3byte (oui) + 2byte */
-	int                   ie_len = 0, sig_data_len = 0;
-	u8                    *ptr;
-	u16                   channel_val = 0;
-	int                   ret = 0;
-	__le16                *le16_ptr = NULL;
-
-	SLSI_DBG3(sdev, SLSI_MLME, "RCL Channel List Indication received\n");
-	ptr =  fapi_get_data(skb);
-
-	sig_data_len = fapi_get_datalen(skb);
-	if (sig_data_len >= 2) {
-		ie_len = ptr[1];
-	} else {
-		SLSI_ERR(sdev, "ERR: Failed to get Fapi data\n");
-		goto exit;
-	}
-
-	while (i < ie_len) {
-		le16_ptr = (__le16 *)&ptr[i];
-		channel_val = le16_to_cpu(*le16_ptr);
-		channel_list[channel_count] = ieee80211_frequency_to_channel(channel_val / 2);
-		if (channel_list[channel_count] < 1 || channel_list[channel_count] > 196) {
-			SLSI_ERR(sdev, "ERR: Invalid channel received %d\n", channel_list[channel_count]);
-			break;
-		}
-		i += 3;
-		channel_count += 1;
-		if (channel_count >= MAX_CHANNEL_COUNT) {
-			SLSI_ERR(sdev, "ERR: Channel list received >= %d\n", MAX_CHANNEL_COUNT);
-			break;
-		}
-	}
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-	ndev_vif->sta.last_connected_bss.ssid[ndev_vif->sta.last_connected_bss.ssid_len] = '\0';
-	ret = slsi_send_rcl_channel_list_event(sdev, channel_count, channel_list, ndev_vif->sta.last_connected_bss.ssid,
-					       ndev_vif->sta.last_connected_bss.ssid_len + 1);
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	if (ret)
-		SLSI_ERR(sdev, "ERR: Failed to send RCL channel list\n");
-exit:
 	kfree_skb(skb);
 }
 

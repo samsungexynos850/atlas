@@ -1,0 +1,138 @@
+name: Build Atlas Kernel
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+jobs:
+  build:
+    name: Build Kernel with Clang r547379
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu \
+            libssl-dev libelf-dev lz4 liblz4-tool make python3 zip tar
+
+      - name: Download Google Clang Toolchain (clang-r547379)
+        run: |
+          mkdir -p toolchain
+          echo "==> Downloading clang-r547379 from Google AOSP..."
+          curl -LSs "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz" | tar -xz -C toolchain
+          echo "$(pwd)/toolchain/bin" >> $GITHUB_PATH
+          echo "==> Clang version:"
+          toolchain/bin/clang --version | head -n 1
+          echo "==> LLD version:"
+          toolchain/bin/ld.lld --version | head -n 1
+
+      - name: Setup AnyKernel3 Flashable Template
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3.git --depth=1 anykernel
+          cat << 'EOF' > anykernel/anykernel.sh
+          ### AnyKernel3 Ramdisk Mod Script
+          ## osm0sis @ xda-developers
+
+          ### AnyKernel setup
+          properties() { '
+          kernel.string=Atlas Kernel with Wi-Fi Fix
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=a21s
+          device.name2=a21snsxx
+          device.name3=SM-A217F
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          ### AnyKernel install
+          boot_attributes() {
+          set_perm_recursive 0 0 755 644 $RAMDISK/*;
+          set_perm_recursive 0 0 750 750 $RAMDISK/init* $RAMDISK/sbin;
+          } # end attributes
+
+          # boot shell variables
+          BLOCK=/dev/block/by-name/boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          # import functions/variables and setup patching
+          . tools/ak3-core.sh;
+
+          # boot install
+          dump_boot;
+
+          # init.rc tweaks
+          backup_file init.rc;
+          replace_string init.rc "cpuctl cpu,timer_slack" "mount cgroup none /dev/cpuctl cpu" "mount cgroup none /dev/cpuctl cpu,timer_slack";
+
+          write_boot;
+          ## end boot install
+          EOF
+          chmod +x anykernel/anykernel.sh
+
+      - name: Compile Atlas Kernel
+        run: |
+          export PATH="$(pwd)/toolchain/bin:$PATH"
+          export ARCH=arm64
+          export LLVM=1
+          export LLVM_IAS=1
+
+          mkdir -p out
+          echo "==> Configuring defconfig: exynos850-a21snsxx_defconfig"
+          make ARCH=arm64 O=out CC=clang exynos850-a21snsxx_defconfig
+          make ARCH=arm64 O=out CC=clang savedefconfig
+
+          # Ensure FAKE_UNAME_5_10 is enabled for S22 One UI port and -Werror is disabled
+          if [ -f "scripts/config" ]; then
+            bash scripts/config --file out/.config --disable CONFIG_WERROR
+            bash scripts/config --file out/.config --disable CONFIG_FAKE_UNAME_NONE
+            bash scripts/config --file out/.config --enable CONFIG_FAKE_UNAME_5_10
+          fi
+
+          echo "==> Starting build..."
+          make ARCH=arm64 O=out CC=clang \
+            KCFLAGS="-w" \
+            KCPPFLAGS="-w" \
+            -j$(nproc --all)
+
+      - name: Package Flashable Zip
+        run: |
+          if [ -f out/arch/arm64/boot/Image ]; then
+            cp out/arch/arm64/boot/Image anykernel/Image
+          elif [ -f out/arch/arm64/boot/Image.gz ]; then
+            cp out/arch/arm64/boot/Image.gz anykernel/Image.gz
+          fi
+
+          # Copy verified Samsung Galaxy A21s Multi-DTB table
+          if [ -f "build_tools/dtb" ]; then
+            echo "==> Using verified Samsung Multi-DTB table from build_tools/dtb"
+            cp build_tools/dtb anykernel/dtb
+          fi
+
+          cd anykernel
+          ZIP_NAME="Atlas.zip"
+          zip -r9 "../$ZIP_NAME" * -x .git README.md *placeholder
+          cd ..
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: Upload Kernel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
